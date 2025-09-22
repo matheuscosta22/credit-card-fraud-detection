@@ -1,0 +1,9 @@
+services:
+  api:
+    build: .
+    container_name: fraud-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: poetry run uvicorn src.api:app --port 8000 --reload --timeout-keep-alive 600
