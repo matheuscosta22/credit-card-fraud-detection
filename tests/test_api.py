@@ -3,9 +3,14 @@ from fastapi.testclient import TestClient
 from src.api import app
 import json
 from pathlib import Path
+import asyncio
+import psutil
+import time
+import httpx
+from httpx import ASGITransport
 
-client = TestClient(app)
-tests_dir = Path(__file__).parent
+testClient = TestClient(app)
+testsDir = Path(__file__).parent
 
 @pytest.fixture
 def sample_transaction():
@@ -42,79 +47,168 @@ def sample_transaction():
         "Amount": 149.62
     }
 
+
 @pytest.fixture
 def sample_batch():
-    with open(tests_dir / "data/non_fraud_transactions.json") as f:
-        transactions = list(json.load(f))
-        return {"transactions": transactions[:5]}  # Pegar apenas 5 transações para teste
+    with open(testsDir / "data/non_fraud_transactions.json") as f:
+        transactionList = list(json.load(f))
+        return {"transactions": transactionList[:5]}  # Pegar apenas 5 transações para teste
+
+
+@pytest.fixture
+def large_batch():
+    with open(testsDir / "data/non_fraud_transactions.json") as f:
+        transactionList = list(json.load(f))
+        # Duplicar transações para criar um lote maior
+        largeTransactionList = transactionList * 20  # 20x mais transações
+        return {"transactions": largeTransactionList}
+
 
 def test_root():
-    response = client.get("/api/v1/fraud-detection/")
-    assert response.status_code == 200
-    assert response.json() == {"status": "API is running"}
+    apiResponse = testClient.get("/api/v1/fraud-detection/")
+    assert apiResponse.status_code == 200
+    assert apiResponse.json() == {"status": "API is running"}
+
 
 def test_predict_single(sample_transaction):
-    response = client.post(
+    apiResponse = testClient.post(
         "/api/v1/fraud-detection/predict",
         json=sample_transaction
     )
-    assert response.status_code == 200
+    assert apiResponse.status_code == 200
     
     # Verificar estrutura da resposta
-    data = response.json()
-    assert "fraud_probability" in data
-    assert "prediction" in data
+    responseData = apiResponse.json()
+    assert "fraud_probability" in responseData
+    assert "prediction" in responseData
     
     # Verificar tipos e valores
-    assert isinstance(data["fraud_probability"], float)
-    assert isinstance(data["prediction"], int)
-    assert 0 <= data["fraud_probability"] <= 1
-    assert data["prediction"] in [0, 1]
+    assert isinstance(responseData["fraud_probability"], float)
+    assert isinstance(responseData["prediction"], int)
+    assert 0 <= responseData["fraud_probability"] <= 1
+    assert responseData["prediction"] in [0, 1]
+
 
 def test_predict_batch(sample_batch):
-    response = client.post(
+    apiResponse = testClient.post(
         "/api/v1/fraud-detection/predict/batch",
         json=sample_batch
     )
-    assert response.status_code == 200
+    assert apiResponse.status_code == 200
     
-    # Verificar estrutura da resposta
-    data = response.json()
-    assert "results" in data
-    assert len(data["results"]) == len(sample_batch["transactions"])
+    # Como é streaming, precisamos ler linha por linha
+    responseLines = apiResponse.iter_lines()
+    partialResults = [json.loads(line) for line in responseLines]
     
-    # Verificar cada resultado
-    for result in data["results"]:
-        assert "index" in result
-        assert "fraud_probability" in result
-        assert "prediction" in result
-        assert isinstance(result["fraud_probability"], float)
-        assert isinstance(result["prediction"], int)
-        assert 0 <= result["fraud_probability"] <= 1
-        assert result["prediction"] in [0, 1]
+    # Verificar último resultado
+    lastResult = partialResults[-1]
+    assert "partial_results" in lastResult
+    resultData = lastResult["partial_results"]
+    
+    assert resultData["processed_count"] == len(sample_batch["transactions"])
+    assert resultData["total_count"] == len(sample_batch["transactions"])
+    assert "fraud_count" in resultData
+    assert "non_fraud_count" in resultData
+    
+    # Verificar resultados individuais
+    for resultItem in resultData["results"]:
+        assert "index" in resultItem
+        assert "fraud_probability" in resultItem
+        assert "prediction" in resultItem
+        assert isinstance(resultItem["fraud_probability"], float)
+        assert isinstance(resultItem["prediction"], int)
+        assert 0 <= resultItem["fraud_probability"] <= 1
+        assert resultItem["prediction"] in [0, 1]
+
+
+def test_large_batch(large_batch):
+    startTime = time.time()
+    processInfo = psutil.Process()
+    initialMemory = processInfo.memory_info().rss / 1024 / 1024  # MB
+    
+    apiResponse = testClient.post(
+        "/api/v1/fraud-detection/predict/batch",
+        json=large_batch
+    )
+    assert apiResponse.status_code == 200
+    
+    # Ler e processar o streaming
+    responseLines = apiResponse.iter_lines()
+    partialResults = []
+    processedIndices = set()
+    
+    for responseLine in responseLines:
+        resultData = json.loads(responseLine)
+        partialResults.append(resultData)
+        
+        # Verificar índices únicos
+        batchData = resultData["partial_results"]
+        for resultItem in batchData["results"]:
+            assert resultItem["index"] not in processedIndices
+            processedIndices.add(resultItem["index"])
+
+    
+    # Verificar completude
+    lastResult = partialResults[-1]["partial_results"]
+    assert lastResult["processed_count"] == len(large_batch["transactions"])
+    assert len(processedIndices) == len(large_batch["transactions"])
+
+
+    totalTime = time.time() - startTime
+    finalMemory = processInfo.memory_info().rss / 1024 / 1024
+    memoryUsage = finalMemory - initialMemory
+    
+    assert totalTime < 30  # Não deve demorar mais que 30 segundos
+    assert memoryUsage < 1024  # Não deve usar mais que 1GB de memória adicional
+
 
 def test_invalid_transaction():
-    invalid_transaction = {
+    invalidData = {
         "Time": "invalid",  # deveria ser int
         "Amount": 100.0,
         "V1": 0.1
     }
     
-    response = client.post(
+    apiResponse = testClient.post(
         "/api/v1/fraud-detection/predict",
-        json=invalid_transaction
+        json=invalidData
     )
-    assert response.status_code == 422  # Erro de validação
+    assert apiResponse.status_code == 422  # Erro de validação
+
 
 def test_invalid_batch():
-    invalid_batch = {
+    invalidData = {
         "transactions": [
             {"Time": "invalid", "Amount": 100.0}  # transação inválida
         ]
     }
     
-    response = client.post(
+    apiResponse = testClient.post(
         "/api/v1/fraud-detection/predict/batch",
-        json=invalid_batch
+        json=invalidData
     )
-    assert response.status_code == 422  # Erro de validação
+    assert apiResponse.status_code == 422  # Erro de validação
+
+
+def test_batch_concurrency(large_batch):
+
+    async def makeRequest(httpClient: httpx.AsyncClient):
+        apiResponse = await httpClient.post(
+            "http://testserver/api/v1/fraud-detection/predict/batch",
+            json=large_batch
+        )
+        return apiResponse.status_code
+
+
+    async def executeRequests():
+        transportHandler = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transportHandler, base_url="http://testserver") as httpClient:
+            requestTasks = [makeRequest(httpClient) for _ in range(4)]  # Tentar 12 requisições simultâneas
+            statusCodes = await asyncio.gather(*requestTasks)
+            return statusCodes
+
+
+    responseResults = asyncio.run(executeRequests())
+    
+    assert any(status == 200 for status in responseResults)  # Algumas devem ter sucesso
+    assert any(status == 500 for status in responseResults)  # Algumas devem ser rejeitadas

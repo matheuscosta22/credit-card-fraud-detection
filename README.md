@@ -157,6 +157,22 @@ curl -X POST "http://localhost:8000/api/v1/fraud-detection/predict/batch" \
 ```
 
 
+## Modelos e Métricas (Hugging Face)
+
+Os arquivos de modelo e métricas são versionados e publicados no Hugging Face Hub.
+
+Repositório: https://huggingface.co/matheuscosta22/credit-card-fraud/tree/main
+
+Arquivos disponíveis:
+- xgboost_model_<timestamp>.pkl e scaler_<timestamp>.pkl
+- metrics_<timestamp>.json
+- Versões "latest": xgboost_model.pkl, scaler.pkl e metrics.json
+
+Variáveis de ambiente:
+- CCFD_HF_REPO: define o repositório do Hugging Face utilizado pela API e pelo treinamento
+- CCFD_HF_TOKEN: token do Hugging Face
+
+
 ## Treinamento do Modelo
 
 O modelo foi treinado com os dados disponíveis no link abaixo.

@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -8,8 +9,10 @@ from xgboost import XGBClassifier
 import numpy as np
 import json
 from pathlib import Path
+from datetime import datetime
+from huggingface_hub import HfApi
 
-def convert_numpy(obj)-> dict:
+def convert_numpy(obj) -> dict:
     if isinstance(obj, dict):
         return {k: convert_numpy(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -19,81 +22,109 @@ def convert_numpy(obj)-> dict:
     else:
         return obj
 
-def add_features(data: pd.DataFrame) -> pd.DataFrame:
-    # Transformação de Amount
-    data["log_amount"] = np.log1p(data["Amount"])
-    data["amount_bin"] = pd.qcut(data["Amount"], q=10, labels=False, duplicates="drop")
+def addFeatures(inputData: pd.DataFrame) -> pd.DataFrame:
+    resultData = inputData.copy()
+    resultData.loc[:, "log_amount"] = np.log1p(resultData["Amount"])
+    resultData.loc[:, "amount_bin"] = pd.qcut(resultData["Amount"], q=10, labels=False, duplicates="drop")
+    resultData.loc[:, "hour"] = (resultData["Time"] // 3600) % 24
+    resultData.loc[:, "day"] = resultData["Time"] // (3600 * 24)
+    return resultData
 
-    # Features temporais a partir de Time
-    data["hour"] = (data["Time"] // 3600) % 24
-    data["day"] = data["Time"] // (3600 * 24)
+def make_model(dataDir: str | Path = "data", repo_id: str | None = None):
+    dataDir = Path(dataDir)
+    modelDir = dataDir.parent / "models"
+    metricsDir = dataDir.parent / "metrics"
 
-    return data
+    os.makedirs(modelDir, exist_ok=True)
+    os.makedirs(metricsDir, exist_ok=True)
 
-def make_model(data_dir: str | Path = "data"):
-    # Garantir diretórios
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("metrics", exist_ok=True)
+    # Resolver repo_id a partir de variável de ambiente, se não informado
+    if repo_id is None:
+        repo_id = os.getenv("CCFD_HF_REPO")
 
-    # Carregar os dados
-    data = pd.read_csv(Path(data_dir) / "creditcard.csv")
+    # Carregar dataset
+    inputData = pd.read_csv(dataDir / "creditcard.csv")
 
-    # Criar novas features
-    data = add_features(data)
+    processedData = addFeatures(inputData)
+    featureData = processedData.drop(columns=["Class"])
+    targetData = processedData["Class"]
 
-    # Separar features e target
-    features = data.drop(columns=["Class"])
-    target = data["Class"]
-
-    # Split em treino e teste
-    X_train, X_test, y_train, y_test = train_test_split(
-        features, target, test_size=0.2, random_state=42, stratify=target
+    # Split dataset
+    trainFeatures, testFeatures, trainTarget, testTarget = train_test_split(
+        featureData, targetData, test_size=0.2, random_state=42, stratify=targetData
     )
 
-    # Normalizar
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # Normalização
+    modelScaler = StandardScaler()
+    trainFeaturesScaled = modelScaler.fit_transform(trainFeatures)
+    testFeaturesScaled = modelScaler.transform(testFeatures)
 
-    # Criar modelo XGBoost
-    model = XGBClassifier(
+    # Modelo XGBoost
+    modelXgb = XGBClassifier(
         n_estimators=200,
         max_depth=5,
         learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
-        scale_pos_weight=len(y_train[y_train == 0]) / len(y_train[y_train == 1]),
+        scale_pos_weight=len(trainTarget[trainTarget == 0]) / len(trainTarget[trainTarget == 1]),
         random_state=42,
         eval_metric="logloss"
     )
+    modelXgb.fit(trainFeaturesScaled, trainTarget)
 
-    # Treinar modelo
-    model.fit(X_train_scaled, y_train)
+    # Predições e métricas
+    fraudPredictions = modelXgb.predict(testFeaturesScaled)
+    modelReport = classification_report(testTarget, fraudPredictions, output_dict=True, zero_division=1)
+    reportClean = convert_numpy(modelReport)
+    print(json.dumps(reportClean, indent=4))
 
-    # Previsões usando threshold fixo
-    fraud_probs = model.predict_proba(X_test_scaled)[:, 1]
-    threshold = 0.2
-    predictions = (fraud_probs >= threshold).astype(int)
+    # === Versionamento ===
+    version_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Avaliar modelo com tratamento para divisão por zero
-    report = classification_report(
-        y_test, 
-        predictions, 
-        output_dict=True,
-        zero_division=1  # Usar 1.0 em vez de 0.0 para métricas indefinidas
-    )
-    report_clean = convert_numpy(report)
+    # Caminhos locais
+    model_path = modelDir / f"xgboost_model_{version_tag}.pkl"
+    scaler_path = modelDir / f"scaler_{version_tag}.pkl"
+    metrics_path = metricsDir / f"metrics_{version_tag}.json"
 
-    # Mostrar relatório
-    print(json.dumps(report_clean, indent=4))
+    # Salvar versões locais
+    joblib.dump(modelXgb, model_path)
+    joblib.dump(modelScaler, scaler_path)
+    with open(metrics_path, "w") as f:
+        json.dump(reportClean, f, indent=4)
 
-    # Salvar modelo e scaler
-    joblib.dump(model, "models/xgboost_model.pkl")
-    joblib.dump(scaler, "models/scaler.pkl")
+    # Salvar versão principal (última)
+    joblib.dump(modelXgb, modelDir / "xgboost_model.pkl")
+    joblib.dump(modelScaler, modelDir / "scaler.pkl")
+    with open(metricsDir / "metrics.json", "w") as f:
+        json.dump(reportClean, f, indent=4)
 
-    # Salvar métricas em JSON
-    with open("metrics/metrics.json", "w") as f:
-        json.dump(report_clean, f, indent=4)
+    print(f"✅ Modelo salvo localmente em {model_path}")
+
+    # === Upload para Hugging Face Hub ===
+    try:
+        hf_token = os.getenv("CCFD_HF_TOKEN")
+        api = HfApi(token=hf_token)
+        api.upload_file(
+            path_or_fileobj=str(model_path),
+            path_in_repo=f"xgboost_model_{version_tag}.pkl",
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        api.upload_file(
+            path_or_fileobj=str(scaler_path),
+            path_in_repo=f"scaler_{version_tag}.pkl",
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        api.upload_file(
+            path_or_fileobj=str(metrics_path),
+            path_in_repo=f"metrics_{version_tag}.json",
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        print(f"✅ Arquivos enviados para o Hugging Face Hub em {repo_id}")
+    except Exception as e:
+        print(f"⚠️ Erro ao enviar para Hugging Face Hub: {e}")
 
 if __name__ == "__main__":
     make_model()
